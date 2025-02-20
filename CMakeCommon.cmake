@@ -302,6 +302,7 @@ function (GenerateAddOnProject target acVersion devKitDir addOnSourcesFolder add
         "ADDON_VERSION=\"${semver}\""
         "ADDON_NAME=\"${addOnName}\""
         "ADDON_LANGUAGE=\"${addOnLanguage}\""
+        "AC_VERSION=${acVersion}"
     )
 
     target_include_directories (${target} SYSTEM PUBLIC ${devKitDir}/Inc)
