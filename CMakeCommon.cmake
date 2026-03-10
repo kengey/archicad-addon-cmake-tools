@@ -1,12 +1,16 @@
+set (CMAKE_VS_GLOBALS UseMultiToolTask=true EnforceProcessCountAcrossBuilds=true)
+
 function (SetGlobalCompilerDefinitions acVersion)
 
     if (WIN32)
         add_definitions (-DUNICODE -D_UNICODE -D_ITERATOR_DEBUG_LEVEL=0)
-        set (CMAKE_MSVC_RUNTIME_LIBRARY MultiThreadedDLL PARENT_SCOPE)
+        set (CMAKE_MSVC_RUNTIME_LIBRARY MultiThreadedDLL CACHE STRING "" FORCE)
     else ()
         add_definitions (-Dmacintosh=1)
         if (${acVersion} GREATER_EQUAL 26)
             set (CMAKE_OSX_ARCHITECTURES "x86_64;arm64" CACHE STRING "" FORCE)
+        else()
+            set (CMAKE_OSX_ARCHITECTURES "x86_64" CACHE STRING "" FORCE)
         endif ()
     endif ()
     add_definitions (-DACExtension)
@@ -17,8 +21,10 @@ function (SetCompilerOptions target acVersion)
 
     if (${acVersion} LESS 27)
         target_compile_features (${target} PUBLIC cxx_std_14)
-    else ()
+    elseif (${acVersion} LESS 29)
         target_compile_features (${target} PUBLIC cxx_std_17)
+    else ()
+        target_compile_features (${target} PUBLIC cxx_std_20)
     endif ()
     target_compile_options (${target} PUBLIC "$<$<CONFIG:Debug>:-DDEBUG>")
     if (WIN32)
@@ -120,7 +126,7 @@ function (parse_version inValue outList)
     endif ()
 endfunction ()
 
-function (generate_add_on_version_info outSemver)
+function (generate_add_on_version_info addOnLanguage outSemver)
     parse_version ("${addOnVersion}" vers)
     if (NOT DEFINED vers)
         message (FATAL_ERROR "'${addOnVersion}' does not follow the '123' or '1.23' or '1.2.3' version format.")
@@ -143,9 +149,19 @@ function (generate_add_on_version_info outSemver)
 
         string (REGEX REPLACE [[(\\|")]] [[\\\1]] addOnDescription "${addOnDescription}")
 
-        set (out "${CMAKE_CURRENT_BINARY_DIR}/${target}-VersionInfo.rc")
-        configure_file ("${CMAKE_CURRENT_FUNCTION_LIST_DIR}/VersionInfo.rc.in" "${out}" @ONLY)
-        target_sources ("${target}" PRIVATE "${out}")
+        if (autoupdate STREQUAL "1")
+            set (autoupdate "\n            VALUE \"Autoupdate\", \"1\"")
+        else ()
+            set (autoupdate "")
+        endif ()
+
+        set (winLangCharset "${AC_WIN_LANGCHARSET}")
+
+        foreach (res IN ITEMS VersionInfo AddOn)
+            set (out "${CMAKE_CURRENT_BINARY_DIR}/${target}-${res}.rc")
+            configure_file ("${CMAKE_CURRENT_FUNCTION_LIST_DIR}/${res}.rc.in" "${out}" @ONLY)
+            target_sources ("${target}" PRIVATE "${out}")
+        endforeach ()
     else ()
         # BE on the safe side; load the info from an existing framework
         file (READ "${devKitDir}/Frameworks/GSRoot.framework/Versions/A/Resources/Info.plist" plist_content NEWLINE_CONSUME)
@@ -171,6 +187,12 @@ function (generate_add_on_version_info outSemver)
             set (privateBuild "")
         endif ()
 
+        if (autoupdate STREQUAL "1")
+            set (autoupdate "\n\t\t<key>autoupdate</key>\n\t\t<string>1</string>")
+        else ()
+            set (autoupdate "")
+        endif ()
+
         string (TOLOWER "${addOnName}" lowerAddOnName)
         string (REGEX REPLACE "[ _]" "-" addOnNameIdentifier "${lowerAddOnName}")
         set (bundleIdentifier "com.graphisoft.${addOnNameIdentifier}")
@@ -188,15 +210,13 @@ function (generate_add_on_version_info outSemver)
     endif ()
 endfunction ()
 
-function (GenerateAddOnProject target acVersion devKitDir addOnSourcesFolder addOnResourcesFolder addOnLanguage)
+function (GenerateAddOnProject target acVersion devKitDir addOnSourcesFolder addOnResourcesFolder addOnLanguage addOnDefaultLanguage addOnPCH)
     verify_api_devkit_folder ("${devKitDir}")
     if (NOT addOnLanguage IN_LIST addOnLanguages)
         message (FATAL_ERROR "Language '${addOnLanguage}' is not among the configured languages in config.json.")
     endif ()
 
-    find_package (Python COMPONENTS Interpreter)
-
-    set (ResourceObjectsDir ${CMAKE_BINARY_DIR}/ResourceObjects)
+    set (ResourceObjectsDir "${CMAKE_CURRENT_BINARY_DIR}/ResourceObjects")
     set (ResourceStampFile "${ResourceObjectsDir}/AddOnResources.stamp")
 
     file (GLOB AddOnImageFiles CONFIGURE_DEPENDS
@@ -218,24 +238,69 @@ function (GenerateAddOnProject target acVersion devKitDir addOnSourcesFolder add
         )
     endif ()
 
+    file (GLOB AddOnJSONResourceFiles CONFIGURE_DEPENDS
+        ${addOnResourcesFolder}/R${addOnDefaultLanguage}/*.json
+        ${addOnResourcesFolder}/RFIX/*.json
+        ${addOnResourcesFolder}/R${addOnDefaultLanguage}/${addOnName}.xlf
+    )
+    file (GLOB AddOnXLIFFFiles CONFIGURE_DEPENDS
+        ${addOnResourcesFolder}/ResourceLibrary/*/XLF/${addOnName}.xlf
+    )
+
+    find_package (Python3 3.10 REQUIRED COMPONENTS Interpreter)
+
+    message (STATUS "Using Python3 interpreter: ${Python3_EXECUTABLE}")
+
+    set (permissiveLocalizationArgument "")
+    if (NOT AC_ADDON_FOR_DISTRIBUTION)
+        set (permissiveLocalizationArgument "--permissiveLocalization")
+    endif ()
+
     get_filename_component (AddOnSourcesFolderAbsolute "${CMAKE_CURRENT_LIST_DIR}/${addOnSourcesFolder}" ABSOLUTE)
     get_filename_component (AddOnResourcesFolderAbsolute "${CMAKE_CURRENT_LIST_DIR}/${addOnResourcesFolder}" ABSOLUTE)
+    if(AC_USE_LOCAL_DEVKIT)
+        set(DEVKIT_BUILDNUM_VALUE "${DEVKIT_BUILDNUM}")
+    else()
+        set(DEVKIT_BUILDNUM_VALUE "default")
+    endif()
     if (WIN32)
         add_custom_command (
             OUTPUT ${ResourceStampFile}
-            DEPENDS ${AddOnResourceFiles} ${AddOnImageFiles}
+            DEPENDS ${AddOnResourceFiles} ${AddOnImageFiles} ${AddOnJSONResourceFiles} ${AddOnXLIFFFiles}
             COMMENT "Compiling resources..."
             COMMAND ${CMAKE_COMMAND} -E make_directory "${ResourceObjectsDir}"
-            COMMAND ${Python_EXECUTABLE} "${CMAKE_CURRENT_FUNCTION_LIST_DIR}/CompileResources.py" "${addOnLanguage}" "${devKitDir}" "${AddOnSourcesFolderAbsolute}" "${AddOnResourcesFolderAbsolute}" "${ResourceObjectsDir}" "${ResourceObjectsDir}/${addOnName}.res"
+            COMMAND ${Python3_EXECUTABLE} "${CMAKE_CURRENT_FUNCTION_LIST_DIR}/CompileResources.py"
+                "${addOnName}"
+                "${addOnLanguage}"
+                "${addOnDefaultLanguage}"
+                "${acVersion}"
+                "${DEVKIT_BUILDNUM_VALUE}"
+                "${devKitDir}"
+                "${AddOnSourcesFolderAbsolute}"
+                "${AddOnResourcesFolderAbsolute}"
+                "${ResourceObjectsDir}"
+                "${ResourceObjectsDir}/${addOnName}.res"
+                ${permissiveLocalizationArgument}
             COMMAND ${CMAKE_COMMAND} -E touch ${ResourceStampFile}
         )
     else ()
         add_custom_command (
             OUTPUT ${ResourceStampFile}
-            DEPENDS ${AddOnResourceFiles} ${AddOnImageFiles}
+            DEPENDS ${AddOnResourceFiles} ${AddOnImageFiles} ${AddOnJSONResourceFiles} ${AddOnXLIFFFiles}
             COMMENT "Compiling resources..."
             COMMAND ${CMAKE_COMMAND} -E make_directory "${ResourceObjectsDir}"
-            COMMAND ${Python_EXECUTABLE} "${CMAKE_CURRENT_FUNCTION_LIST_DIR}/CompileResources.py" "${addOnLanguage}" "${devKitDir}" "${AddOnSourcesFolderAbsolute}" "${AddOnResourcesFolderAbsolute}" "${ResourceObjectsDir}" "${CMAKE_BINARY_DIR}/$<CONFIG>/${addOnName}.bundle/Contents/Resources"
+            COMMAND ${Python3_EXECUTABLE} "${CMAKE_CURRENT_FUNCTION_LIST_DIR}/CompileResources.py"
+                "${addOnName}"
+                "${addOnLanguage}"
+                "${addOnDefaultLanguage}"
+                "${acVersion}"
+                "${DEVKIT_BUILDNUM_VALUE}"
+                "${devKitDir}"
+                "${AddOnSourcesFolderAbsolute}"
+                "${AddOnResourcesFolderAbsolute}"
+                "${ResourceObjectsDir}"
+                "${CMAKE_BINARY_DIR}/$<CONFIG>/${addOnName}.bundle/Contents/Resources"
+                ${permissiveLocalizationArgument}
             COMMAND ${CMAKE_COMMAND} -E copy "${devKitDir}/Inc/PkgInfo" "${CMAKE_BINARY_DIR}/$<CONFIG>/${addOnName}.bundle/Contents/PkgInfo"
             COMMAND ${CMAKE_COMMAND} -E touch ${ResourceStampFile}
         )
@@ -255,12 +320,14 @@ function (GenerateAddOnProject target acVersion devKitDir addOnSourcesFolder add
         ${AddOnSourceFiles}
         ${AddOnImageFiles}
         ${AddOnResourceFiles}
+        ${AddOnJSONResourceFiles}
+        ${AddOnXLIFFFiles}
         ${ResourceStampFile}
     )
 
     source_group ("Sources" FILES ${AddOnHeaderFiles} ${AddOnSourceFiles})
     source_group ("Images" FILES ${AddOnImageFiles})
-    source_group ("Resources" FILES ${AddOnResourceFiles})
+    source_group ("Resources" FILES ${AddOnResourceFiles} ${AddOnJSONResourceFiles} ${AddOnXLIFFFiles})
     if (WIN32)
         add_library (${target} SHARED ${AddOnFiles})
     else ()
@@ -296,7 +363,7 @@ function (GenerateAddOnProject target acVersion devKitDir addOnSourcesFolder add
             )
         endif ()
     endif ()
-    generate_add_on_version_info (semver)
+    generate_add_on_version_info (${addOnLanguage} semver)
     target_compile_definitions (
         "${target}" PRIVATE
         "ADDON_VERSION=\"${semver}\""
@@ -309,22 +376,14 @@ function (GenerateAddOnProject target acVersion devKitDir addOnSourcesFolder add
     target_include_directories (${target} PUBLIC ${addOnSourcesFolder})
 
     # use GSRoot custom allocators consistently in the Add-On
-    get_filename_component(new_hpp "${devKitDir}/Modules/GSRoot/GSNew.hpp" REALPATH)
-    get_filename_component(malloc_hpp "${devKitDir}/Modules/GSRoot/GSMalloc.hpp" REALPATH)
-    if(CMAKE_CXX_COMPILER_ID STREQUAL "MSVC")
-        target_compile_options(
-            "${target}" PRIVATE
-            "SHELL:/FI \"${new_hpp}\""
-            "SHELL:/FI \"${malloc_hpp}\""
-        )
-    elseif(CMAKE_CXX_COMPILER_ID MATCHES "Clang\$")
-        target_compile_options(
-            "${target}" PRIVATE
-            "SHELL:-include \"${new_hpp}\""
-            "SHELL:-include \"${malloc_hpp}\""
-        )
+    # if you specify a precompiled header, make sure <GSNew.hpp> and <GSMalloc.hpp> are the first includes
+    if (addOnPCH)
+        target_precompile_headers("${target}" PRIVATE "${addOnPCH}")
     else()
-        message(FATAL_ERROR "Unknown compiler ID. Please open an issue at https://github.com/GRAPHISOFT/archicad-addon-cmake-tools")
+        target_precompile_headers(
+            "${target}" PRIVATE
+            "${CMAKE_CURRENT_FUNCTION_LIST_DIR}/AddOn.hpp"
+        )
     endif()
 
     LinkGSLibrariesToProject (${target} ${acVersion} ${devKitDir})
@@ -374,9 +433,8 @@ function (ReadConfigJson)
         set ("${out}" "${${out}}" PARENT_SCOPE)
     endforeach ()
 
-    # optional members (macOS code signing for start)
-    set (optionalMembers codesignIdentity developmentTeamId)
-    set (returnAs codesignIdentity developmentTeamId)
+    set (optionalMembers codesignIdentity developmentTeamId autoupdate)
+    set (returnAs codesignIdentity developmentTeamId autoupdate)
     foreach (out members IN ZIP_LISTS returnAs optionalMembers)
         string (JSON "${out}" ERROR_VARIABLE error GET "${json}" ${members})
         if (error)
@@ -385,7 +443,6 @@ function (ReadConfigJson)
         set ("${out}" "${${out}}" PARENT_SCOPE)
     endforeach ()
 
-    # language list
     string (JSON languagesType ERROR_VARIABLE error TYPE "${json}" languages)
     if (error OR NOT languagesType STREQUAL "ARRAY")
         message (FATAL_ERROR "'languages' in config.json must be an array: ${error}")

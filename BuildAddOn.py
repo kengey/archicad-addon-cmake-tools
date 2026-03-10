@@ -12,6 +12,9 @@ import urllib.request
 import zipfile
 import tarfile
 
+from LocalizationMappingTable import FillLocalizationMappingTable
+
+
 def ParseArguments ():
     parser = argparse.ArgumentParser ()
     parser.add_argument ('-c', '--configFile', dest = 'configFile', required = True, help = 'JSON Configuration file')
@@ -183,7 +186,9 @@ def GetInstalledVisualStudioGenerator ():
     if len (vsWhereOutput) == 0:
         raise Exception ('No installed Visual Studio detected!')
     vsVersion = vsWhereOutput[0]['installationVersion'].split ('.')[0]
-    if vsVersion == '17':
+    if vsVersion == '18':
+        return 'Visual Studio 18 2026'
+    elif vsVersion == '17':
         return 'Visual Studio 17 2022'
     elif vsVersion == '16':
         return 'Visual Studio 16 2019'
@@ -199,27 +204,37 @@ def GetToolset (version):
     return 'v143'
 
 
-def GetProjectGenerationParams (workspaceRootFolder, buildPath, platformName, devKitFolder, version, languageCode, release, additionalParams):
+def GetProjectGenerationParams (args, workspaceRootFolder, buildPath, platformName, devKitFolder, version, languageCode, release, additionalParams):
     # Add params to configure cmake
     projGenParams = [
         'cmake',
         '-B', str (buildPath)
     ]
 
+    devkitDir = devKitFolder / "Support"
     if platformName == 'WIN':
         projGenParams.extend ([
             '-G', GetInstalledVisualStudioGenerator (),
             '-T', GetToolset (int (version)),
         ])
+        localizationMappingTable = FillLocalizationMappingTable (devkitDir)
+        winLangCharset = '040904b0'
+        if languageCode != 'INT':
+            winLangCharset = localizationMappingTable.get (languageCode, winLangCharset)
+        projGenParams.append (f'-DAC_WIN_LANGCHARSET={winLangCharset}')
     elif platformName == 'MAC':
         projGenParams.append ('-GXcode')
 
     projGenParams.append (f'-DAC_VERSION={version}')
-    projGenParams.append (f'-DAC_API_DEVKIT_DIR={str (devKitFolder / "Support")}')
+    projGenParams.append (f'-DAC_API_DEVKIT_DIR={str (devkitDir)}')
     projGenParams.append (f'-DAC_ADDON_LANGUAGE={languageCode}')
 
     if release:
         projGenParams.append ('-DAC_ADDON_FOR_DISTRIBUTION=ON')
+
+    if args.devKitPath is not None:
+        projGenParams.append ('-DAC_USE_LOCAL_DEVKIT=ON')
+        projGenParams.append (f'-DDEVKIT_BUILDNUM={args.buildNum}')
 
     if additionalParams is not None:
         for key in additionalParams:
@@ -230,11 +245,11 @@ def GetProjectGenerationParams (workspaceRootFolder, buildPath, platformName, de
     return projGenParams
 
 
-def BuildAddOn (addOnName, platformName, additionalParams, workspaceRootFolder, buildFolder, devKitFolder, version, configuration, languageCode, release, quiet):
+def BuildAddOn (args, addOnName, platformName, additionalParams, workspaceRootFolder, buildFolder, devKitFolder, version, configuration, languageCode, release, quiet):
     buildPath = buildFolder / addOnName / version / languageCode
 
     # Add params to configure cmake
-    projGenParams = GetProjectGenerationParams (workspaceRootFolder, buildPath, platformName, devKitFolder, version, languageCode, release, additionalParams)
+    projGenParams = GetProjectGenerationParams (args, workspaceRootFolder, buildPath, platformName, devKitFolder, version, languageCode, release, additionalParams)
     projGenResult = CallCommand (projGenParams, quiet)
 
     if projGenResult != 0:
@@ -253,7 +268,7 @@ def BuildAddOn (addOnName, platformName, additionalParams, workspaceRootFolder, 
         raise Exception ('Failed to build project!')
 
 
-def BuildAddOns (addOnName, buildConfigList, languageList, additionalParams, workspaceRootFolder, buildFolder, devKitFolderList, release, quiet):
+def BuildAddOns (args, addOnName, buildConfigList, languageList, additionalParams, workspaceRootFolder, buildFolder, devKitFolderList, release, quiet):
     platformName = GetPlatformName ()
 
     try:
@@ -262,7 +277,7 @@ def BuildAddOns (addOnName, buildConfigList, languageList, additionalParams, wor
 
             for languageCode in languageList:
                 for config in buildConfigList:
-                    BuildAddOn (addOnName, platformName, additionalParams, workspaceRootFolder, buildFolder, devKitFolder, version, config, languageCode, release, quiet)
+                    BuildAddOn (args, addOnName, platformName, additionalParams, workspaceRootFolder, buildFolder, devKitFolder, version, config, languageCode, release, quiet)
 
     except Exception as e:
         raise e
@@ -339,7 +354,7 @@ def Main ():
 
         os.chdir (workspaceRootFolder)
 
-        BuildAddOns (addOnName, buildConfigList, languageList, additionalParams, workspaceRootFolder, buildFolder, devKitFolderList, args.release, args.quiet)
+        BuildAddOns (args, addOnName, buildConfigList, languageList, additionalParams, workspaceRootFolder, buildFolder, devKitFolderList, args.release, args.quiet)
 
         if args.package:
             PackageAddOns (args, devKitData, addOnName, buildConfigList, acVersionList, languageList, buildFolder, packageRootFolder)
@@ -354,3 +369,4 @@ def Main ():
 
 if __name__ == "__main__":
     Main ()
+
